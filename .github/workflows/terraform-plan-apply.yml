@@ -1,0 +1,156 @@
+name: Terraform Plan & Apply (Branch-based)
+
+on:
+  push:
+    branches:
+      - develop
+      - stage
+      - main
+  pull_request:
+    branches:
+      - develop
+      - stage
+      - main
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  TF_VERSION: 1.7.5
+  AWS_REGION: me-central-1
+  TF_CLI_ARGS_init: "-backend-config=../../backend.hcl"
+
+jobs:
+  determine-env:
+    runs-on: ubuntu-latest
+    outputs:
+      env_dir: ${{ steps.map.outputs.env_dir }}
+      aws_role: ${{ steps.map.outputs.aws_role }}
+    steps:
+      - id: map
+        run: |
+          if [[ "${GITHUB_REF_NAME}" == "develop" ]]; then
+            echo "env_dir=env/dev" >> $GITHUB_OUTPUT
+            echo "aws_role=${{ secrets.AWS_ROLE_TO_ASSUME_DEV }}" >> $GITHUB_OUTPUT
+          elif [[ "${GITHUB_REF_NAME}" == "stage" ]]; then
+            echo "env_dir=env/stage" >> $GITHUB_OUTPUT
+            echo "aws_role=${{ secrets.AWS_ROLE_TO_ASSUME_STAGE }}" >> $GITHUB_OUTPUT
+          else
+            echo "env_dir=env/prod" >> $GITHUB_OUTPUT
+            echo "aws_role=${{ secrets.AWS_ROLE_TO_ASSUME_PROD }}" >> $GITHUB_OUTPUT
+          fi
+
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: determine-env
+    defaults:
+      run:
+        working-directory: ${{ needs.determine-env.outputs.env_dir }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ needs.determine-env.outputs.aws_role }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Format Check
+        run: terraform fmt -check
+
+      - name: Validate Terraform
+        run: terraform validate
+
+      - name: Static Code Analysis (tfsec)
+        uses: aquasecurity/tfsec-action@v1.0.3
+
+      - name: IaC Security Scan (Checkov)
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: ${{ needs.determine-env.outputs.env_dir }}
+          soft_fail: false
+
+      - name: Secret Scanning (Gitleaks)
+        uses: zricethezav/gitleaks-action@v2
+        with:
+          config: .github/gitleaks.toml
+
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -input=false -out=tfplan
+
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-${{ github.ref_name }}
+          path: ${{ needs.determine-env.outputs.env_dir }}/tfplan
+
+      - name: Comment plan summary on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('${{ needs.determine-env.outputs.env_dir }}/tfplan', 'utf8');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: "Terraform Plan completed ✅ for **${{ github.ref_name }}** environment"
+            });
+
+  apply:
+    name: Terraform Apply (Approved)
+    needs: [plan, determine-env]
+    if: github.ref_name == 'develop' || github.ref_name == 'stage' || github.ref_name == 'main'
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.ref_name }}
+      url: https://console.aws.amazon.com/
+    concurrency: tf-${{ github.ref_name }}
+    defaults:
+      run:
+        working-directory: ${{ needs.determine-env.outputs.env_dir }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ needs.determine-env.outputs.aws_role }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan-${{ github.ref_name }}
+          path: ${{ needs.determine-env.outputs.env_dir }}
+
+      - name: Manual Approval Gate
+        if: github.ref_name == 'stage' || github.ref_name == 'main'
+        uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ github.token }}
+          approvers: "CTO,devops-lead"
+          minimum-approvals: 1
+          issue-title: "Approve Terraform Apply for ${{ github.ref_name }}"
+          issue-body: "Please approve to deploy changes to ${{ github.ref_name }} environment."
+
+      - name: Terraform Apply
+        run: terraform apply -input=false tfplan

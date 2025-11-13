@@ -1,0 +1,140 @@
+name: infra-ci-cd
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+  schedule:
+    - cron: "15 2 * * *"  # 02:15 UTC daily backup validation
+
+permissions:
+  id-token: write    # for OIDC
+  contents: read
+
+env:
+  AWS_REGION: me-central-1
+  TF_VERSION: "1.7.5"
+
+jobs:
+  validate_and_plan:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: env/dev   # set per-environment via matrix if you like
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME_DEV }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        run: terraform init -backend-config=../../backend.hcl
+
+      - name: Terraform Format
+        run: terraform fmt -check
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Checkov - IaC Security Scan
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          soft_fail: false
+
+      - name: Terraform Plan
+        run: terraform plan -input=false -out=tfplan
+
+      - name: Upload plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-dev
+          path: env/dev/tfplan
+
+  apply_main_on_push:
+    if: github.ref == 'refs/heads/main'
+    needs: validate_and_plan
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: env/dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME_DEV }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        run: terraform init -backend-config=../../backend.hcl
+
+      - name: Download plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-dev
+          path: env/dev
+
+      - name: Terraform Apply
+        run: terraform apply -input=false "tfplan"
+
+  # Daily backup verification (sample) + Blue/Green upgrade hook
+  daily_backup_and_bluegreen:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS (OIDC -> prod)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify latest snapshots exist
+        run: |
+          set -e
+          for DB in prod-otc prod-gps prod-arp; do
+            SNAP=$(aws rds describe-db-snapshots --db-instance-identifier "$DB" --snapshot-type automated \
+              --query "DBSnapshots|sort_by(@,&SnapshotCreateTime)[-1].DBSnapshotIdentifier" --output text)
+            echo "$DB -> $SNAP"
+            test "$SNAP" != "None"
+          done
+
+      - name: (Optional) Blue/Green create (manual toggle)
+        if: ${{ false }}   # set to true when you want to run
+        run: |
+          # Example for ARP engine upgrade: create blue/green deployment
+          aws rds create-blue-green-deployment \
+            --blue-green-deployment-name "arp-upgrade-$(date +%Y%m%d)" \
+            --source "prod-arp" \
+            --target-engine-version "16.4" \
+            --environment "PRODUCTION" \
+            --region "${AWS_REGION}"
+
+  # Trivy example if you build any container images (Grafana custom, etc.)
+  trivy_scan_example:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aquasecurity/trivy-action@0.22.0
+        with:
+          image-ref: "grafana/grafana:latest"
+          format: 'table'
+          vuln-type: 'os,library'
+          exit-code: '1'
+          ignore-unfixed: true

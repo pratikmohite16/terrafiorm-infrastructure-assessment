@@ -1,0 +1,29 @@
+name: Security Scanning
+
+on:
+  push:
+    paths:
+      - '**.tf'
+      - '**.yml'
+      - '.github/workflows/**'
+  workflow_dispatch:
+
+jobs:
+  sast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: CodeQL Analysis
+        uses: github/codeql-action/init@v3
+        with: { languages: 'python,javascript' }
+      - uses: github/codeql-action/analyze@v3
+
+  trivy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aquasecurity/trivy-action@v0.22.0
+        with:
+          scan-type: 'config'
+          format: 'table'
+          severity: 'HIGH,CRITICAL'
+          exit-code: '1'

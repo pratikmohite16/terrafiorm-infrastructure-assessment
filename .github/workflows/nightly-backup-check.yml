@@ -1,0 +1,29 @@
+name: Nightly RDS Backup Validation
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+
+jobs:
+  backup-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS (prod)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME_PROD }}
+          aws-region: me-central-1
+      - name: Verify RDS snapshots
+        run: |
+          for DB in prod-otc prod-gps prod-arp; do
+            SNAP=$(aws rds describe-db-snapshots --db-instance-identifier "$DB" \
+              --snapshot-type automated --query "DBSnapshots|sort_by(@,&SnapshotCreateTime)[-1].DBSnapshotIdentifier" --output text)
+            echo "$DB -> $SNAP"
+            test "$SNAP" != "None"
+          done
+      - name: Validate Backup Integrity
+        run: |
+          echo "Restoring one snapshot temporarily for verification..."
+          SNAP=$(aws rds describe-db-snapshots --db-instance-identifier prod-arp --query "DBSnapshots|sort_by(@,&SnapshotCreateTime)[-1].DBSnapshotIdentifier" --output text)
+          aws rds restore-db-instance-from-db-snapshot --db-instance-identifier "verify-arp-$(date +%H%M)" --db-snapshot-identifier "$SNAP"
+          echo "✅ Backup validation test launched."
