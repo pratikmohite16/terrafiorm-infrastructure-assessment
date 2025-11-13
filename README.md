@@ -128,8 +128,6 @@ terraform-infrastructure-assessment/
 ├── backend.hcl                # Remote backend configuration
 ├── versions.tf                # Version constraints
 │
-├── DECISIONS.md
-├── MIGRATION_NOTES.md
 ├── SECURITY_PRACTICES.md
 ├── DR_SIMULATION.md
 └── TEAM_HANDOVER.md
@@ -334,4 +332,5 @@ This repository provides:
 * DR simulation
 * Security hardening
 * Clear documentation for audit & handover
+
 
